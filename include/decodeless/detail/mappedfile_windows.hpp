@@ -492,6 +492,7 @@ public:
         if (size > m_capacity)
             throw std::bad_alloc();
 
+        // TODO: not sure if extend() can truncate
         if (m_section) {
             m_section->extend(size);
         } else {
