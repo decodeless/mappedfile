@@ -2,9 +2,10 @@
 
 #pragma once
 
-#include <errno.h>
-#include <fcntl.h>
 #include <decodeless/detail/mappedfile_common.hpp>
+#include <errno.h>
+#include <exception>
+#include <fcntl.h>
 #include <string.h>
 #include <string>
 #include <sys/mman.h>
@@ -120,6 +121,21 @@ public:
         if (msync(const_cast<void*>(m_address), m_size, flags) == -1)
             throw LastError();
     }
+    void resize(size_t size) {
+#if 0
+        void* addr = mremap(m_address, m_size, size,
+                            MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP, m_address);
+#else
+        void* addr = mremap(m_address, m_size, size, 0);
+#endif
+        if (addr == MAP_FAILED) {
+            throw LastError();
+        } else if (addr != m_address) {
+            // Unrecoverable
+            fprintf(stderr, "fatal: mremap() moved the mapping");
+            std::terminate();
+        }
+    }
 
 private:
     void unmap() {
@@ -172,7 +188,7 @@ public:
     ResizableMappedFile(const ResizableMappedFile& other) = delete;
     ResizableMappedFile(ResizableMappedFile&& other) noexcept = default;
     ResizableMappedFile(const fs::path& path, size_t maxSize)
-        : m_reserved(nullptr, maxSize, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+        : m_reserved(nullptr, maxSize, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)
         , m_file(path, O_CREAT | O_RDWR, 0666) {
         size_t size = throwIfAbove(m_file.size(), m_reserved.size());
         if (size)
@@ -200,6 +216,8 @@ public:
 
 private:
     void map(size_t size) {
+        // TODO: if m_mapped shrinks, does m_reserved instead need to be
+        // recreated to fill the gap?
         m_mapped.emplace(m_reserved.address(), size, MAP_FIXED | MAP_SHARED_VALIDATE, m_file, 0);
     }
     static size_t throwIfAbove(size_t v, size_t limit) {
@@ -214,6 +232,85 @@ private:
 
 static_assert(std::is_move_constructible_v<ResizableMappedFile>);
 static_assert(std::is_move_assignable_v<ResizableMappedFile>);
+
+class ResizableMappedMemory {
+public:
+    ResizableMappedMemory() = delete;
+    ResizableMappedMemory(const ResizableMappedMemory& other) = delete;
+    ResizableMappedMemory(ResizableMappedMemory&& other) noexcept = default;
+    ResizableMappedMemory(size_t initialSize, size_t maxSize)
+        : m_reserved(nullptr, maxSize, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) {
+        if (initialSize)
+            map(initialSize);
+    }
+    ResizableMappedMemory& operator=(const ResizableMappedMemory& other) = delete;
+    void*                  data() const { return m_size ? m_reserved.address() : nullptr; }
+    size_t                 size() const { return m_size; }
+    size_t                 capacity() const { return m_reserved.size(); }
+    void                   resize(size_t size) {
+        size = throwIfAbove(size, m_reserved.size());
+        if (size)
+            map(size);
+    }
+
+    ResizableMappedMemory& operator=(ResizableMappedMemory&& other) noexcept = default;
+
+private:
+    void map(size_t size) {
+        // TODO: if m_mapped shrinks, does m_reserved instead need to be
+        // recreated to fill the gap?
+        size_t ps = pageSize();
+        size_t mappedSize = ((size + ps - 1) / ps) * ps; // TODO: cache?
+        if (mappedSize == 0) {
+            if (mmap(const_cast<void*>(m_reserved.address()), mappedSize, PROT_READ | PROT_WRITE,
+                     MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED)
+                throw LastError();
+        } else {
+#if 1
+            // Map any additional pages needed. Don't remap existing pages or
+            // they get zeroed. Another idea might be a memory fd.
+            if (mappedSize > m_mappedSize) {
+                if (mmap(reinterpret_cast<void*>(uintptr_t(m_reserved.address()) + m_mappedSize),
+                         mappedSize - m_mappedSize, PROT_READ | PROT_WRITE,
+                         MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED)
+                    throw LastError();
+                m_mappedSize = mappedSize;
+            }
+#else
+    #if 1
+            // Remap? Specs say old and new addresses cannot be the same,
+            // although it only errors out when remapping more than a page.
+            void* addr =
+                mremap(m_reserved.address(), m_size, size,
+                       MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP, m_reserved.address());
+    #else
+            // Remap without MREMAP_FIXED - immediately fails because it can't
+            // replace the reserved mapping.
+            void* addr = mremap(m_reserved.address(), m_size, size, 0);
+    #endif
+            if (addr == MAP_FAILED) {
+                throw LastError();
+            } else if (addr != m_reserved.address()) {
+                // Unrecoverable
+                fprintf(stderr, "fatal: mremap() moved the mapping");
+                std::terminate();
+            }
+#endif
+        }
+        m_size = size;
+    }
+    static size_t throwIfAbove(size_t v, size_t limit) {
+        if (v > limit)
+            throw std::bad_alloc();
+        return v;
+    }
+    detail::MemoryMap<PROT_NONE> m_reserved;
+    size_t                       m_size = 0;
+    size_t                       m_mappedSize = 0;
+};
+
+static_assert(std::is_move_constructible_v<ResizableMappedMemory>);
+static_assert(std::is_move_assignable_v<ResizableMappedMemory>);
 
 } // namespace detail
 

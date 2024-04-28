@@ -18,6 +18,11 @@ inline size_t pageSize() {
     return info.dwPageSize;
 }
 
+static inline size_t pageSizeCached() {
+    static size_t size = pageSize();
+    return size;
+}
+
 class Message {
 public:
     Message() = delete;
@@ -278,11 +283,16 @@ typedef struct _SECTION_IMAGE_INFORMATION {
     ULONG Unknown2[3];
 } SECTION_IMAGE_INFORMATION, *PSECTION_IMAGE_INFORMATION;
 
+using NtAllocateVirtualMemoryType = NTSTATUS(HANDLE ProcessHandle, PVOID* BaseAddress,
+                                             ULONG_PTR ZeroBits, PSIZE_T RegionSize,
+                                             ULONG AllocationType, ULONG Protect);
 using NtCreateSectionType = NTSTATUS(PHANDLE SectionHandle, ACCESS_MASK DesiredAccess,
                                      POBJECT_ATTRIBUTES ObjectAttributes,
                                      PLARGE_INTEGER MaximumSize, ULONG SectionPageProtection,
                                      ULONG AllocationAttributes, HANDLE FileHandle);
 using NtExtendSectionType = NTSTATUS(HANDLE SectionHandle, PLARGE_INTEGER NewSectionSize);
+using NtFreeVirtualMemoryType = NTSTATUS(HANDLE ProcessHandle, PVOID* BaseAddress,
+                                         PSIZE_T RegionSize, ULONG FreeType);
 using NtMapViewOfSectionType = NTSTATUS(HANDLE SectionHandle, HANDLE ProcessHandle,
                                         PVOID* BaseAddress, ULONG_PTR ZeroBits, SIZE_T CommitSize,
                                         PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize,
@@ -307,8 +317,11 @@ class NtifsSection {
 public:
     NtifsSection()
         : m_ntdll("ntdll.dll")
+        , m_NtAllocateVirtualMemory(
+              m_ntdll.get<NtAllocateVirtualMemoryType>("NtAllocateVirtualMemory"))
         , m_NtCreateSection(m_ntdll.get<NtCreateSectionType>("NtCreateSection"))
         , m_NtExtendSection(m_ntdll.get<NtExtendSectionType>("NtExtendSection"))
+        , m_NtFreeVirtualMemory(m_ntdll.get<NtFreeVirtualMemoryType>("NtFreeVirtualMemory"))
         , m_NtMapViewOfSection(m_ntdll.get<NtMapViewOfSectionType>("NtMapViewOfSection"))
         , m_NtOpenSection(m_ntdll.get<NtOpenSectionType>("NtOpenSection"))
         , m_NtClose(m_ntdll.get<NtCloseType>("NtClose"))
@@ -322,13 +335,107 @@ private:
     DynamicLibrary m_ntdll;
 
 public:
-    NtCreateSectionType* const      m_NtCreateSection;
-    NtExtendSectionType* const      m_NtExtendSection;
-    NtMapViewOfSectionType* const   m_NtMapViewOfSection;
-    NtOpenSectionType* const        m_NtOpenSection;
-    NtCloseType* const              m_NtClose;
-    NtQuerySectionType* const       m_NtQuerySection;
-    NtUnmapViewOfSectionType* const m_NtUnmapViewOfSection;
+    NtAllocateVirtualMemoryType* const m_NtAllocateVirtualMemory;
+    NtCreateSectionType* const         m_NtCreateSection;
+    NtExtendSectionType* const         m_NtExtendSection;
+    NtFreeVirtualMemoryType* const     m_NtFreeVirtualMemory;
+    NtMapViewOfSectionType* const      m_NtMapViewOfSection;
+    NtOpenSectionType* const           m_NtOpenSection;
+    NtCloseType* const                 m_NtClose;
+    NtQuerySectionType* const          m_NtQuerySection;
+    NtUnmapViewOfSectionType* const    m_NtUnmapViewOfSection;
+};
+
+// It is cumbersome to pass around a module handle, so this static call returns a common one when
+// needed. Ideally this would be in just one compilation unit but this is a header-only library.
+static inline NtifsSection& ntifs() {
+    static NtifsSection ntifs;
+    return ntifs;
+}
+
+class VirtualMemory {
+public:
+    VirtualMemory() = delete;
+    VirtualMemory(const VirtualMemory& other) = delete;
+    VirtualMemory(const NtifsSection& dll, HANDLE ProcessHandle, ULONG_PTR ZeroBits,
+                  SIZE_T RegionSize, ULONG AllocationType, ULONG Protect)
+        : m_dll(dll)
+        , m_process(ProcessHandle)
+        , m_address(allocateVirtualMemory(dll, m_process, ZeroBits, nullptr, RegionSize,
+                                          AllocationType, Protect)
+                        .first) {}
+    constexpr VirtualMemory(VirtualMemory&& other) noexcept
+        : m_dll(other.m_dll)
+        , m_address(other.m_address) {
+        other.m_address = nullptr;
+    }
+    VirtualMemory& operator=(const VirtualMemory& other) = delete;
+    VirtualMemory& operator=(VirtualMemory&& other) noexcept {
+        free();
+        m_address = other.m_address;
+        other.m_address = nullptr;
+        return *this;
+    }
+    ~VirtualMemory() { free(); }
+
+    // Use to convert a region of memory from reserved to committed. Returns the possibly-rounded-up
+    // size of the modified region.
+    size_t commit(ULONG_PTR ZeroBits, SIZE_T Offset, SIZE_T RegionSize, ULONG Protect) {
+        assert(RegionSize != 0);
+        auto [addr, size] = allocateVirtualMemory(m_dll, m_process, ZeroBits, offsetAddress(Offset),
+                                                  RegionSize, MEM_COMMIT, Protect);
+        assert(Offset > 0 || addr == m_address);
+        return size;
+    }
+
+    // Use to convert a committed region of memory to a reserved virtual address range.
+    void decommit(SIZE_T Offset, SIZE_T RegionSize) {
+        // Round up offset to the next page
+        size_t ps = pageSizeCached();
+        size_t offsetRoundedUp = ((Offset + ps - 1) / ps) * ps;
+        size_t end = Offset + RegionSize;
+
+        // Ignore degenerate decommits where the region decommitted does not cross a page boundary
+        if (end <= offsetRoundedUp)
+            return;
+
+        void*    address = offsetAddress(offsetRoundedUp);
+        size_t   size = end - offsetRoundedUp;
+        NTSTATUS status = m_dll.m_NtFreeVirtualMemory(m_process, &address, &size, MEM_DECOMMIT);
+        if (status != STATUS_SUCCESS)
+            throw NtStatusError(m_dll.ntdll(), "NtFreeVirtualMemory", status);
+    }
+    void* address() const { return m_address; }
+
+private:
+    static std::pair<void*, size_t> allocateVirtualMemory(const NtifsSection& dll,
+                                                          HANDLE ProcessHandle, ULONG_PTR ZeroBits,
+                                                          PVOID BaseAddress, SIZE_T RegionSize,
+                                                          ULONG AllocationType, ULONG Protect) {
+        void*    result = BaseAddress;
+        size_t   resultSize = RegionSize;
+        NTSTATUS status = dll.m_NtAllocateVirtualMemory(ProcessHandle, &result, ZeroBits,
+                                                        &resultSize, AllocationType, Protect);
+        if (status != STATUS_SUCCESS)
+            throw NtStatusError(dll.ntdll(), "NtAllocateVirtualMemory", status);
+        return {result, resultSize};
+    }
+    void free() {
+        if (m_address) {
+            size_t   size = 0;
+            NTSTATUS status =
+                m_dll.m_NtFreeVirtualMemory(m_process, &m_address, &size, MEM_RELEASE);
+            if (status != STATUS_SUCCESS)
+                NtStatusError(m_dll.ntdll(), "NtFreeVirtualMemory", status)
+                    .print(); // can't throw from destructor. ignore the error
+        }
+    }
+    void* offsetAddress(SIZE_T Offset) const {
+        return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(m_address) + Offset);
+    }
+    const NtifsSection& m_dll;
+    HANDLE              m_process = INVALID_HANDLE_VALUE;
+    void*               m_address = nullptr;
 };
 
 template <ULONG SectionPageProtection>
@@ -504,10 +611,6 @@ public:
     }
 
 private:
-    static NtifsSection& ntifs() {
-        static NtifsSection ntifs;
-        return ntifs;
-    }
     size_t                                     m_capacity = 0;
     FileHandle                                 m_file;
     std::optional<Section<PAGE_READWRITE>>     m_section;
@@ -516,6 +619,44 @@ private:
 
 static_assert(std::is_move_constructible_v<ResizableMappedFile>);
 static_assert(std::is_move_assignable_v<ResizableMappedFile>);
+
+class ResizableMappedMemory {
+public:
+    ResizableMappedMemory(size_t initialSize, size_t maxSize)
+        : m_capacity(maxSize)
+        , m_memory(ntifs(), NtifsSection::CurrentProcess(), 0, m_capacity, MEM_RESERVE,
+                   PAGE_NOACCESS) {
+        if (initialSize)
+            resize(initialSize);
+    }
+    void*  data() const { return m_size ? m_memory.address() : nullptr; }
+    size_t size() const { return m_size; }
+    size_t capacity() const { return m_capacity; }
+    void   resize(size_t size) {
+        // Artificially fail on overflow. The NtAllocateVirtualMemory() call succeeds without error,
+        // but the memory becomes unreadable afterwards.
+        if (size > m_capacity)
+            throw std::bad_alloc();
+
+        if (size > m_size)
+            m_memory.commit(0, 0, size, PAGE_READWRITE);
+        else
+            m_memory.decommit(size, m_size - size);
+        m_size = size;
+    }
+
+private:
+    static NtifsSection& ntifs() {
+        static NtifsSection ntifs;
+        return ntifs;
+    }
+    size_t        m_capacity = 0;
+    size_t        m_size = 0;
+    VirtualMemory m_memory;
+};
+
+static_assert(std::is_move_constructible_v<ResizableMappedMemory>);
+static_assert(std::is_move_assignable_v<ResizableMappedMemory>);
 
 } // namespace detail
 

@@ -13,6 +13,7 @@ namespace fs = std::filesystem;
 class mapping_error : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
+    void print() const { fprintf(stderr, "Error: %s\n", what()); }
 };
 
 class mapped_file_error : public fs::filesystem_error {
