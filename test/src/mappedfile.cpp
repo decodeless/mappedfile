@@ -110,6 +110,13 @@ TEST_F(MappedFileFixture, Reserve) {
 
 // TODO: FILE_MAP_LARGE_PAGES
 
+TEST_F(MappedFileFixture, WinAllocationGranulairty) {
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    EXPECT_GE(info.dwAllocationGranularity, sizeof(std::max_align_t));
+    EXPECT_GE(info.dwAllocationGranularity, 4096u);
+}
+
 #else
 
 TEST_F(MappedFileFixture, LinuxFileDescriptor) {
@@ -219,17 +226,16 @@ TEST_F(MappedFileFixture, LinuxResize) {
 
 #endif
 
-TEST_F(MappedFileFixture, Resize) {
-    fs::path   tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
+TEST_F(MappedFileFixture, ResizeMemory) {
     const char str[] = "hello world!";
     {
-        resizable_file file(tmpFile2, 1500);
+        resizable_memory file(0, 10000);
         EXPECT_EQ(file.data(), nullptr);
         EXPECT_EQ(file.size(), 0);
 #ifdef _WIN32
-        // EXPECT_THROW(file.resize(detail::pageSize() + 1), std::bad_alloc);
+        EXPECT_THROW(file.resize(10001), std::bad_alloc);
 #else
-        EXPECT_THROW(file.resize(1501), std::bad_alloc);
+        EXPECT_THROW(file.resize(10001), std::bad_alloc);
 #endif
         file.resize(13);
         EXPECT_EQ(file.size(), 13);
@@ -241,6 +247,10 @@ TEST_F(MappedFileFixture, Resize) {
         EXPECT_EQ(file.size(), 1500);
         EXPECT_EQ(file.data(), before);
         EXPECT_TRUE(std::ranges::equal(str, fileStr));
+        file.resize(10000);
+        EXPECT_EQ(file.size(), 10000);
+        EXPECT_EQ(file.data(), before);
+        EXPECT_TRUE(std::ranges::equal(str, fileStr));
         std::ranges::copy(std::string("EOF"),
                           reinterpret_cast<char*>(file.data()) + file.size() - 3);
 
@@ -249,28 +259,133 @@ TEST_F(MappedFileFixture, Resize) {
         // be performed on a file with a user-mapped section open.") so another
         // temporary file is mapped.
 #ifdef _WIN32
-        file = resizable_file(m_tmpFile, 1500);
+        file = resizable_memory(0, 1500);
         EXPECT_NE(file.data(), before);
 #endif
-        file = resizable_file(tmpFile2, 1500);
+        file = resizable_memory(0, 1500);
+
+#ifndef _WIN32
+        EXPECT_NE(file.data(), before);
+#endif
+    }
+}
+
+TEST_F(MappedFileFixture, ResizeMemoryExtended) {
+    size_t           nextBytes = 1;
+    resizable_memory memory(nextBytes, 1llu << 32); // 4gb of virtual memory pls
+    void*            data = memory.data();
+    uint8_t*         bytes = reinterpret_cast<uint8_t*>(data);
+    bytes[0] = 1;
+
+    // Grow
+    while ((nextBytes *= 2) <= 256 * 1024 * 1024) {
+        EXPECT_NO_THROW(memory.resize(nextBytes));
+        EXPECT_EQ(data, memory.data());
+        uint8_t b = 0;
+        // Verify memory from previous resizes remains intact
+        for (size_t i = 1; i < nextBytes; i *= 2)
+            EXPECT_EQ(bytes[i - 1], ++b);
+        bytes[nextBytes - 1] = ++b;
+    }
+
+    // Shrink
+    while ((nextBytes /= 2) > 1) {
+        EXPECT_NO_THROW(memory.resize(nextBytes));
+        EXPECT_EQ(data, memory.data());
+        uint8_t b = 0;
+        // Verify memory from previous resizes remains intact
+        for (size_t i = 1; i < nextBytes; i *= 2)
+            EXPECT_EQ(bytes[i - 1], ++b);
+    }
+}
+
+TEST_F(MappedFileFixture, ResizeFile) {
+    fs::path   tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
+    const char str[] = "hello world!";
+    {
+        resizable_file file(tmpFile2, 10000);
+        EXPECT_EQ(file.data(), nullptr);
+        EXPECT_EQ(file.size(), 0);
+        EXPECT_THROW(file.resize(10001), std::bad_alloc);
+        file.resize(13);
+        EXPECT_EQ(file.size(), 13);
+        std::span fileStr(reinterpret_cast<char*>(file.data()), std::size(str));
+        std::ranges::copy(str, fileStr.begin());
+        EXPECT_TRUE(std::ranges::equal(str, fileStr));
+        void* before = file.data();
+        file.resize(1500);
+        EXPECT_EQ(file.size(), 1500);
+        EXPECT_EQ(file.data(), before);
+        EXPECT_TRUE(std::ranges::equal(str, fileStr));
+        file.resize(10000);
+        EXPECT_EQ(file.size(), 10000);
+        EXPECT_EQ(file.data(), before);
+        EXPECT_TRUE(std::ranges::equal(str, fileStr));
+        std::ranges::copy(std::string("EOF"),
+                          reinterpret_cast<char*>(file.data()) + file.size() - 3);
+
+        // Test the move assignment operator. On linux the file is briefly
+        // mapped twice. Windows gets an error ("The requested operation cannot
+        // be performed on a file with a user-mapped section open.") so another
+        // temporary file is mapped.
+#ifdef _WIN32
+        file = resizable_file(m_tmpFile, 10000);
+        EXPECT_NE(file.data(), before);
+#endif
+        file = resizable_file(tmpFile2, 10000);
 
 #ifndef _WIN32
         EXPECT_NE(file.data(), before);
 #endif
 
-        EXPECT_EQ(file.size(), 1500);
+        EXPECT_EQ(file.size(), 10000);
         std::span eof(reinterpret_cast<char*>(file.data()) + file.size() - 3, 3);
         EXPECT_TRUE(std::ranges::equal(std::string("EOF"), eof));
     }
     EXPECT_THROW((void)resizable_file(tmpFile2, 1499), std::bad_alloc);
     {
-        resizable_file file(tmpFile2, 4096);
-        EXPECT_EQ(file.size(), 1500);
+        resizable_file file(tmpFile2, 20000);
+        EXPECT_EQ(file.size(), 10000);
         std::span eof(reinterpret_cast<char*>(file.data()) + file.size() - 3, 3);
         EXPECT_TRUE(std::ranges::equal(std::string("EOF"), eof));
         file.resize(13);
         std::span fileStr(reinterpret_cast<char*>(file.data()), std::size(str));
         EXPECT_TRUE(std::ranges::equal(str, fileStr));
+    }
+    fs::remove(tmpFile2);
+    EXPECT_FALSE(fs::exists(tmpFile2));
+}
+
+TEST_F(MappedFileFixture, ResizeFileExtended) {
+    fs::path   tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
+    {
+        resizable_file file(tmpFile2, 1llu << 32); // 4gb of virtual memory pls
+        file.resize(1);
+        void*          data = file.data();
+        uint8_t*       bytes = reinterpret_cast<uint8_t*>(data);
+        bytes[0] = 1;
+
+        // Grow
+        size_t nextBytes = 1;
+        while ((nextBytes *= 2) <= 256 * 1024 * 1024) {
+            EXPECT_NO_THROW(file.resize(nextBytes));
+            EXPECT_EQ(data, file.data());
+            uint8_t b = 0;
+            // Verify memory from previous resizes remains intact
+            for (size_t i = 1; i < nextBytes; i *= 2)
+                EXPECT_EQ(bytes[i - 1], ++b);
+            bytes[nextBytes - 1] = ++b;
+        }
+
+        // Shrink
+        while ((nextBytes /= 2) > 1) {
+            EXPECT_NO_THROW(file.resize(nextBytes));
+            EXPECT_EQ(data, file.data());
+            uint8_t b = 0;
+            // Verify memory from previous resizes remains intact
+            for (size_t i = 1; i < nextBytes; i *= 2)
+                EXPECT_EQ(bytes[i - 1], ++b);
+        }
     }
     fs::remove(tmpFile2);
     EXPECT_FALSE(fs::exists(tmpFile2));
