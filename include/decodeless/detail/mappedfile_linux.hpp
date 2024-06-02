@@ -93,7 +93,8 @@ public:
     MemoryMap(const MemoryMap& other) = delete;
     MemoryMap(MemoryMap&& other) noexcept
         : m_size(other.m_size)
-        , m_address(other.m_address) {
+        , m_address(other.m_address)
+        , m_fixed(other.m_fixed) {
         other.m_address = MAP_FAILED;
     }
     MemoryMap& operator=(const MemoryMap& other) = delete;
@@ -102,6 +103,7 @@ public:
         unmap();
         m_size = other.m_size;
         m_address = other.m_address;
+        m_fixed = other.m_fixed;
         other.m_address = MAP_FAILED;
         return *this;
     }

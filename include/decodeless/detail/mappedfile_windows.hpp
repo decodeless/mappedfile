@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <assert.h>
 #include <decodeless/detail/mappedfile_common.hpp>
 #include <windows.h>
 
