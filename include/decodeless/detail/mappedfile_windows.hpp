@@ -458,6 +458,8 @@ public:
     size_t size() const { return m_size; }
 
     LONGLONG extend(size_t NewSectionSize) {
+        // Truncation will do nothing and is not supported.
+        // https://stackoverflow.com/questions/51311421/memory-mapped-file-truncation-on-windows
         LARGE_INTEGER NewSectionSizeL{.QuadPart = LONGLONG(NewSectionSize)};
         NTSTATUS      status = m_dll.m_NtExtendSection(*this, &NewSectionSizeL);
         if (status != STATUS_SUCCESS)
@@ -591,6 +593,22 @@ public:
         if (existingSize > 0)
             resize(existingSize);
     }
+    ~ResizableMappedFile() {
+        // Truncate the file to the last size requested.
+        if (m_file) {
+            size_t finalSize = size();
+
+            // Unmap the file before truncating the file
+            m_view.reset();
+            m_section.reset();
+
+            // Truncate
+            m_file.setPointer(finalSize);
+            m_file.setEndOfFile();
+        }
+    }
+    ResizableMappedFile(ResizableMappedFile&& other) = default;
+    ResizableMappedFile& operator=(ResizableMappedFile&& other) = default;
     void*  data() const { return m_view ? m_view->address() : nullptr; }
     size_t size() const { return m_section ? m_section->size() : 0; }
     size_t capacity() const { return m_capacity; }
@@ -600,7 +618,7 @@ public:
         if (size > m_capacity)
             throw std::bad_alloc();
 
-        // TODO: not sure if extend() can truncate
+        // Note: truncation is ignored until the object is destroyed
         if (m_section) {
             m_section->extend(size);
         } else {

@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <exception>
 #include <fcntl.h>
+#include <limits>
 #include <string.h>
 #include <string>
 #include <sys/mman.h>
@@ -159,9 +160,10 @@ private:
         }
     }
 
-    size_t       m_size;
-    address_type m_address;
-    bool         m_fixed;
+    // default initialization "should" never happen
+    size_t       m_size = std::numeric_limits<size_t>::max();
+    address_type m_address = nullptr;
+    bool         m_fixed = false;
 };
 
 using MemoryMapRO = detail::MemoryMap<PROT_READ>;
