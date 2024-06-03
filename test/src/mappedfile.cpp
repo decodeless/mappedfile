@@ -391,6 +391,19 @@ TEST_F(MappedFileFixture, ResizeFileExtended) {
     EXPECT_FALSE(fs::exists(tmpFile2));
 }
 
+TEST_F(MappedFileFixture, ResizableFileSize) {
+    size_t lastSize = fs::file_size(m_tmpFile);
+    size_t sizes[] = {0, 1, 2, 4000, 4095, 4096, 4097, 10000, 0, 4097, 4096, 4095, 42};
+    for (size_t size : sizes) {
+        resizable_file file(m_tmpFile, 10000);
+        EXPECT_EQ(file.size(), lastSize);
+        file.resize(size);
+        EXPECT_EQ(file.size(), size);
+        lastSize = size;
+    }
+    EXPECT_EQ(fs::file_size(m_tmpFile), lastSize);
+}
+
 TEST_F(MappedFileFixture, Readme) {
     fs::path       tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
     {
