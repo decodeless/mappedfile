@@ -41,7 +41,7 @@ public:
     using StatResult = struct stat;
     FileDescriptor(const fs::path& path, int flags, int mode = 0666 /* octal permissions */)
         : m_fd(open(path.c_str(), flags, mode)) {
-        if (!*this) {
+        if (m_fd == -1) {
             throw LastMappedFileError(path);
         }
     }
@@ -53,12 +53,16 @@ public:
     }
     FileDescriptor& operator=(const FileDescriptor& other) = delete;
     FileDescriptor& operator=(FileDescriptor&& other) noexcept {
-        close(m_fd);
+        if(m_fd != -1)
+            close(m_fd);
         m_fd = other.m_fd;
         other.m_fd = -1;
         return *this;
     }
-    ~FileDescriptor() { close(m_fd); }
+    ~FileDescriptor() {
+        if (m_fd != -1)
+            close(m_fd);
+    }
     operator int() const { return m_fd; }
     StatResult stat() const {
         StatResult result;
@@ -71,6 +75,7 @@ public:
         if (ftruncate(m_fd, size) == -1)
             throw LastError();
     }
+    explicit operator bool() const = delete;  // possibly unexpected due to operator int()
 
 private:
     int m_fd;
