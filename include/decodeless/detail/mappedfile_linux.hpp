@@ -197,46 +197,40 @@ public:
     ResizableMappedFile(const ResizableMappedFile& other) = delete;
     ResizableMappedFile(ResizableMappedFile&& other) noexcept = default;
     ResizableMappedFile(const fs::path& path, size_t maxSize)
-        : m_reserved(nullptr, maxSize, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)
-        , m_file(path, O_CREAT | O_RDWR, 0666) {
-        size_t size = throwIfAbove(m_file.size(), m_reserved.size());
-        if (size)
-            map(size);
-    }
+        : m_file(path, O_CREAT | O_RDWR, 0666)
+        , m_size(throwIfAbove(m_file.size(), maxSize))
+        // Map the entire reserved range (previously a separate MAP_PRIVATE
+        // mapping was created). SIGBUS is raised on out of bounds access and
+        // calling ftruncate() without remapping seems to just work. I'll take
+        // the improved perf!
+        , m_mapped(nullptr, maxSize, MAP_SHARED_VALIDATE, m_file, 0) {}
     ResizableMappedFile& operator=(const ResizableMappedFile& other) = delete;
-    void*                data() const { return m_mapped ? m_mapped->address() : nullptr; }
-    size_t               size() const { return m_mapped ? m_mapped->size() : 0; }
-    size_t               capacity() const { return m_reserved.size(); }
+    void*                data() const { return m_size != 0 ? m_mapped.address() : nullptr; }
+    size_t               size() const { return m_size; }
+    size_t               capacity() const { return m_mapped.size(); }
     void                 resize(size_t size) {
-        size = throwIfAbove(size, m_reserved.size());
-        m_mapped.reset();
-        m_file.truncate(size);
-        if (size)
-            map(size);
+        m_file.truncate(throwIfAbove(size, capacity()));
+        m_size = size;
     }
 
-    // Override default move assignment so m_reserved outlives m_mapped
+    // Override default move assignment so m_file outlives m_mapped
+    // TODO: fix this by having the mapping own the file descriptor
     ResizableMappedFile& operator=(ResizableMappedFile&& other) noexcept {
         m_mapped = std::move(other.m_mapped);
+        m_size = other.m_size;
         m_file = std::move(other.m_file);
-        m_reserved = std::move(other.m_reserved);
         return *this;
     }
 
 private:
-    void map(size_t size) {
-        // TODO: if m_mapped shrinks, does m_reserved instead need to be
-        // recreated to fill the gap?
-        m_mapped.emplace(m_reserved.address(), size, MAP_FIXED | MAP_SHARED_VALIDATE, m_file, 0);
-    }
     static size_t throwIfAbove(size_t v, size_t limit) {
         if (v > limit)
             throw std::bad_alloc();
         return v;
     }
-    detail::MemoryMap<PROT_NONE>       m_reserved;
-    FileDescriptor                     m_file;
-    std::optional<detail::MemoryMapRW> m_mapped;
+    FileDescriptor      m_file;
+    size_t              m_size;
+    detail::MemoryMapRW m_mapped;
 };
 
 static_assert(std::is_move_constructible_v<ResizableMappedFile>);
