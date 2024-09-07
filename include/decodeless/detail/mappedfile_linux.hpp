@@ -186,7 +186,7 @@ public:
     size_t    size() const { return m_mapped.size(); }
 
 private:
-    static constexpr int MapMemoryProtection = Writable ? PROT_READ : PROT_READ | PROT_WRITE;
+    static constexpr int MapMemoryProtection = Writable ? PROT_READ | PROT_WRITE : PROT_READ;
     FileDescriptor       m_file;
     MemoryMap<MapMemoryProtection> m_mapped;
 };
