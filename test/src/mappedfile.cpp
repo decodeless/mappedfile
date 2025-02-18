@@ -1,10 +1,10 @@
 // Copyright (c) 2024 Pyarelal Knowles, MIT License
 
 #include <cstdio>
+#include <decodeless/mappedfile.hpp>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
-#include <decodeless/mappedfile.hpp>
 #include <ostream>
 #include <span>
 
@@ -36,7 +36,7 @@ TEST_F(MappedFileFixture, FileHandle) {
     EXPECT_TRUE(file); // a bit pointless - would have thrown if not
 }
 
-TEST_F(MappedFileFixture, Create) {
+TEST(MappedFile, Create) {
     fs::path tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
     EXPECT_FALSE(fs::exists(tmpFile2));
     if (fs::exists(tmpFile2))
@@ -63,7 +63,7 @@ TEST_F(MappedFileFixture, Create) {
     EXPECT_FALSE(fs::exists(tmpFile2));
 }
 
-TEST_F(MappedFileFixture, Reserve) {
+TEST(MappedFile, Reserve) {
     fs::path tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
     {
         // Create a new file
@@ -124,7 +124,57 @@ TEST_F(MappedFileFixture, LinuxFileDescriptor) {
     EXPECT_NE(fd, -1);
 }
 
-TEST_F(MappedFileFixture, LinuxCreate) {
+// Won't catch SIGBUS
+#if 0
+#include <setjmp.h>
+#include <signal.h>
+jmp_buf* g_sigbusJmpbufPtr = nullptr;
+TEST_F(MappedFileFixture, LinuxOvermapWrite) {
+    EXPECT_EQ(fs::file_size(m_tmpFile), sizeof(int));
+    size_t overmapSize = 1024 * 1024 * 1024;
+    detail::FileDescriptor                    fd(m_tmpFile, O_RDWR);
+    detail::MemoryMap<PROT_READ | PROT_WRITE> mapped(nullptr, overmapSize, MAP_SHARED, fd, 0);
+    auto                                      signalHandler = []([[maybe_unused]] int sig) {
+        if (sig == SIGBUS)
+            siglongjmp(*g_sigbusJmpbufPtr, 1);
+    };
+    jmp_buf sigbusJmpbuf;
+    g_sigbusJmpbufPtr = &sigbusJmpbuf;
+    if (sigsetjmp(sigbusJmpbuf, 1) == 0) {
+        signal(SIGBUS, signalHandler);
+        // Write way past the end of the file's region. This should raise SIGBUS
+        std::span data(reinterpret_cast<uint8_t*>(mapped.address()), mapped.size());
+        data.back() = 142;
+        EXPECT_TRUE(false) << "Expected SIGBUS";
+    }
+    signal(SIGINT, SIG_DFL);
+    g_sigbusJmpbufPtr = nullptr;
+    EXPECT_EQ(fs::file_size(m_tmpFile), sizeof(int));
+}
+#endif
+
+TEST_F(MappedFileFixture, LinuxOvermapResizeWrite) {
+    size_t overmapSize = 1024 * 1024;
+    EXPECT_EQ(fs::file_size(m_tmpFile), sizeof(int));
+    {
+        detail::FileDescriptor fd(m_tmpFile, O_RDWR);
+        detail::MemoryMapRW    mapped(nullptr, overmapSize, MAP_SHARED, fd, 0);
+        fd.truncate(overmapSize);
+
+        std::span data(reinterpret_cast<uint8_t*>(mapped.address()), mapped.size());
+        data.back() = 142;
+    }
+    EXPECT_EQ(fs::file_size(m_tmpFile), overmapSize);
+    {
+        std::ifstream ifile(m_tmpFile, std::ios::binary);
+        uint8_t lastByte;
+        ifile.seekg(overmapSize-sizeof(lastByte));
+        ifile.read(reinterpret_cast<char*>(&lastByte), sizeof(lastByte));
+        EXPECT_EQ(lastByte, 142);
+    }
+}
+
+TEST(MappedFile, LinuxCreate) {
     fs::path tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
     EXPECT_FALSE(fs::exists(tmpFile2));
     {
@@ -156,7 +206,7 @@ TEST_F(MappedFileFixture, LinuxReserve) {
     EXPECT_EQ(*reinterpret_cast<const int*>(mapped.address()), 42);
 }
 
-TEST_F(MappedFileFixture, LinuxResize) {
+TEST(MappedFile, LinuxResize) {
     // Reserve some virtual address space
     detail::MemoryMap<PROT_NONE> reserved(nullptr, detail::pageSize() * 4,
                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -219,10 +269,6 @@ TEST_F(MappedFileFixture, LinuxResize) {
     fs::remove(tmpFile2);
     EXPECT_FALSE(fs::exists(tmpFile2));
 }
-
-// TODO:
-// - MAP_HUGETLB
-// - MAP_HUGE_2MB, MAP_HUGE_1GB
 
 #endif
 
@@ -404,8 +450,34 @@ TEST_F(MappedFileFixture, ResizableFileSize) {
     EXPECT_EQ(fs::file_size(m_tmpFile), lastSize);
 }
 
-TEST_F(MappedFileFixture, Readme) {
-    fs::path       tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
+TEST(MappedFile, Empty) {
+    fs::path tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
+    EXPECT_FALSE(fs::exists(tmpFile2));
+    {
+        size_t         maxSize = 4096;
+        resizable_file file(tmpFile2, maxSize);
+        EXPECT_TRUE(fs::exists(tmpFile2));
+        EXPECT_EQ(file.size(), 0);
+    }
+    EXPECT_TRUE(fs::exists(tmpFile2));
+    EXPECT_EQ(fs::file_size(tmpFile2), 0);
+    fs::remove(tmpFile2);
+    EXPECT_FALSE(fs::exists(tmpFile2));
+}
+
+TEST_F(MappedFileFixture, ClearExisting) {
+    EXPECT_EQ(fs::file_size(m_tmpFile), sizeof(int));
+    {
+        size_t         maxSize = 4096;
+        resizable_file file(m_tmpFile, maxSize);
+        EXPECT_EQ(file.size(), sizeof(int));
+        file.resize(0);
+    }
+    EXPECT_EQ(fs::file_size(m_tmpFile), 0);
+}
+
+TEST(MappedFile, Readme) {
+    fs::path tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
     {
         size_t         maxSize = 4096;
         resizable_file file(tmpFile2, maxSize);
