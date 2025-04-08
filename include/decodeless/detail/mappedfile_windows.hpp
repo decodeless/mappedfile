@@ -206,6 +206,7 @@ public:
             FreeLibrary(m_module);
         m_module = other.m_module;
         other.m_module = nullptr;
+        return *this;
     }
     ~DynamicLibrary() {
         if (m_module)
@@ -365,7 +366,7 @@ public:
         , m_address(allocateVirtualMemory(dll, m_process, ZeroBits, nullptr, RegionSize,
                                           AllocationType, Protect)
                         .first) {}
-    constexpr VirtualMemory(VirtualMemory&& other) noexcept
+    VirtualMemory(VirtualMemory&& other) noexcept
         : m_dll(other.m_dll)
         , m_address(other.m_address) {
         other.m_address = nullptr;
@@ -439,6 +440,20 @@ private:
     void*               m_address = nullptr;
 };
 
+static HANDLE createSection(const NtifsSection& dll, ACCESS_MASK DesiredAccess,
+                            POBJECT_ATTRIBUTES ObjectAttributes, LONGLONG MaximumSize,
+                            ULONG SectionPageProtection, ULONG AllocationAttributes,
+                            HANDLE FileHandle) {
+    HANDLE        result;
+    LARGE_INTEGER MaximumSizeL{.QuadPart = MaximumSize};
+    NTSTATUS      status =
+        dll.m_NtCreateSection(&result, DesiredAccess, ObjectAttributes, &MaximumSizeL,
+                              SectionPageProtection, AllocationAttributes, FileHandle);
+    if (status != STATUS_SUCCESS)
+        throw NtStatusError(dll.ntdll(), "NtCreateSection", status);
+    return result;
+}
+
 template <ULONG SectionPageProtection>
 class Section : public Handle {
 public:
@@ -489,19 +504,6 @@ public:
     };
 
 private:
-    static HANDLE createSection(const NtifsSection& dll, ACCESS_MASK DesiredAccess,
-                                POBJECT_ATTRIBUTES ObjectAttributes, LONGLONG MaximumSize,
-                                ULONG SectionPageProtection, ULONG AllocationAttributes,
-                                HANDLE FileHandle) {
-        HANDLE        result;
-        LARGE_INTEGER MaximumSizeL{.QuadPart = MaximumSize};
-        NTSTATUS      status =
-            dll.m_NtCreateSection(&result, DesiredAccess, ObjectAttributes, &MaximumSizeL,
-                                  SectionPageProtection, AllocationAttributes, FileHandle);
-        if (status != STATUS_SUCCESS)
-            throw NtStatusError(dll.ntdll(), "NtCreateSection", status);
-        return result;
-    }
     const NtifsSection& m_dll;
     size_t              m_size;
 };
