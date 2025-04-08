@@ -9,6 +9,7 @@
 #include <limits>
 #include <string.h>
 #include <string>
+#include <optional>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
