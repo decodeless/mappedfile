@@ -91,7 +91,11 @@ public:
     MemoryMap(address_type addr, size_t length, int flags, int fd, off_t offset)
         : m_size(length)
         , m_address(mmap(const_cast<void*>(addr), length, MemoryProtection, flags, fd, offset))
-        , m_fixed((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0) {
+        , m_fixed((flags & (MAP_FIXED
+#if !__APPLE__
+                | MAP_FIXED_NOREPLACE
+#endif
+                )) != 0) {
         if (m_address == MAP_FAILED) {
             throw LastError();
         }
@@ -228,7 +232,7 @@ private:
     void map(size_t size) {
         // TODO: if m_mapped shrinks, does m_reserved instead need to be
         // recreated to fill the gap?
-        m_mapped.emplace(m_reserved.address(), size, MAP_FIXED | MAP_SHARED_VALIDATE, m_file, 0);
+        m_mapped.emplace(m_reserved.address(), size, MAP_FIXED | MAP_SHARED, m_file, 0);
     }
     static size_t throwIfAbove(size_t v, size_t limit) {
         if (v > limit)
@@ -272,14 +276,17 @@ private:
         size_t ps = pageSize();
         size_t mappedSize = ((size + ps - 1) / ps) * ps; // TODO: cache?
         if (mappedSize == 0) {
+            // Cannot move, as it's reserved, and we throw if we try to exceed.
             if (mmap(const_cast<void*>(m_reserved.address()), mappedSize, PROT_READ | PROT_WRITE,
-                     MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED)
+                     MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) {
                 throw LastError();
+            }
         } else {
 #if 1
             // Map any additional pages needed. Don't remap existing pages or
             // they get zeroed. Another idea might be a memory fd.
             if (mappedSize > m_mappedSize) {
+                // Cannot move, as it's reserved, and we throw if we try to exceed.
                 if (mmap(reinterpret_cast<void*>(uintptr_t(m_reserved.address()) + m_mappedSize),
                          mappedSize - m_mappedSize, PROT_READ | PROT_WRITE,
                          MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED)
