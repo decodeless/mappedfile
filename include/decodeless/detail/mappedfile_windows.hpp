@@ -384,6 +384,8 @@ public:
     // size of the modified region.
     size_t commit(ULONG_PTR ZeroBits, SIZE_T Offset, SIZE_T RegionSize, ULONG Protect) {
         assert(RegionSize != 0);
+        assert(Offset % pageSizeCached() == 0);
+        assert(RegionSize % pageSizeCached() == 0);
         auto [addr, size] = allocateVirtualMemory(m_dll, m_process, ZeroBits, offsetAddress(Offset),
                                                   RegionSize, MEM_COMMIT, Protect);
         assert(Offset > 0 || addr == m_address);
@@ -392,18 +394,12 @@ public:
 
     // Use to convert a committed region of memory to a reserved virtual address range.
     void decommit(SIZE_T Offset, SIZE_T RegionSize) {
-        // Round up offset to the next page
-        size_t ps = pageSizeCached();
-        size_t offsetRoundedUp = ((Offset + ps - 1) / ps) * ps;
-        size_t end = Offset + RegionSize;
-
-        // Ignore degenerate decommits where the region decommitted does not cross a page boundary
-        if (end <= offsetRoundedUp)
-            return;
-
-        void*    address = offsetAddress(offsetRoundedUp);
-        size_t   size = end - offsetRoundedUp;
-        NTSTATUS status = m_dll.m_NtFreeVirtualMemory(m_process, &address, &size, MEM_DECOMMIT);
+        assert(RegionSize != 0);
+        assert(Offset % pageSizeCached() == 0);
+        assert(RegionSize % pageSizeCached() == 0);
+        void*    address = offsetAddress(Offset);
+        NTSTATUS status =
+            m_dll.m_NtFreeVirtualMemory(m_process, &address, &RegionSize, MEM_DECOMMIT);
         if (status != STATUS_SUCCESS)
             throw NtStatusError(m_dll.ntdll(), "NtFreeVirtualMemory", status);
     }
@@ -659,10 +655,16 @@ public:
         if (size > m_capacity)
             throw std::bad_alloc();
 
-        if (size > m_size)
-            m_memory.commit(0, 0, size, PAGE_READWRITE);
-        else
-            m_memory.decommit(size, m_size - size);
+        // Align up to the next page, but keep 'size' for the user
+        size_t ps = pageSizeCached();
+        size_t newMappedSize = ((size + ps - 1) / ps) * ps;
+
+        // Add/remove just the new range
+        if (newMappedSize > m_mappedSize)
+            m_memory.commit(0, m_mappedSize, newMappedSize - m_mappedSize, PAGE_READWRITE);
+        else if (newMappedSize < m_mappedSize)
+            m_memory.decommit(newMappedSize, m_mappedSize - newMappedSize);
+        m_mappedSize = newMappedSize;
         m_size = size;
     }
 
@@ -673,6 +675,7 @@ private:
     }
     size_t        m_capacity = 0;
     size_t        m_size = 0;
+    size_t        m_mappedSize = 0;
     VirtualMemory m_memory;
 };
 
