@@ -359,16 +359,10 @@ class VirtualMemory {
 public:
     VirtualMemory() = delete;
     VirtualMemory(const VirtualMemory& other) = delete;
-    VirtualMemory(const NtifsSection& dll, HANDLE ProcessHandle, ULONG_PTR ZeroBits,
-                  SIZE_T RegionSize, ULONG AllocationType, ULONG Protect)
-        : m_dll(dll)
-        , m_process(ProcessHandle)
-        , m_address(allocateVirtualMemory(dll, m_process, ZeroBits, nullptr, RegionSize,
-                                          AllocationType, Protect)
-                        .first) {}
+    VirtualMemory(SIZE_T RegionSize, ULONG AllocationType, ULONG Protect)
+        : m_address(virtualAlloc(nullptr, RegionSize, AllocationType, Protect)) {}
     VirtualMemory(VirtualMemory&& other) noexcept
-        : m_dll(other.m_dll)
-        , m_address(other.m_address) {
+        : m_address(other.m_address) {
         other.m_address = nullptr;
     }
     VirtualMemory& operator=(const VirtualMemory& other) = delete;
@@ -382,14 +376,14 @@ public:
 
     // Use to convert a region of memory from reserved to committed. Returns the possibly-rounded-up
     // size of the modified region.
-    size_t commit(ULONG_PTR ZeroBits, SIZE_T Offset, SIZE_T RegionSize, ULONG Protect) {
+    size_t commit(SIZE_T Offset, SIZE_T RegionSize, ULONG Protect) {
         assert(RegionSize != 0);
         assert(Offset % pageSizeCached() == 0);
         assert(RegionSize % pageSizeCached() == 0);
-        auto [addr, size] = allocateVirtualMemory(m_dll, m_process, ZeroBits, offsetAddress(Offset),
-                                                  RegionSize, MEM_COMMIT, Protect);
+        [[maybe_unused]] void* addr =
+            virtualAlloc(offsetAddress(Offset), RegionSize, MEM_COMMIT, Protect);
         assert(Offset > 0 || addr == m_address);
-        return size;
+        return RegionSize;
     }
 
     // Use to convert a committed region of memory to a reserved virtual address range.
@@ -397,43 +391,30 @@ public:
         assert(RegionSize != 0);
         assert(Offset % pageSizeCached() == 0);
         assert(RegionSize % pageSizeCached() == 0);
-        void*    address = offsetAddress(Offset);
-        NTSTATUS status =
-            m_dll.m_NtFreeVirtualMemory(m_process, &address, &RegionSize, MEM_DECOMMIT);
-        if (status != STATUS_SUCCESS)
-            throw NtStatusError(m_dll.ntdll(), "NtFreeVirtualMemory", status);
+        if (!VirtualFree(offsetAddress(Offset), RegionSize, MEM_DECOMMIT))
+            throw LastError();
     }
     void* address() const { return m_address; }
 
 private:
-    static std::pair<void*, size_t> allocateVirtualMemory(const NtifsSection& dll,
-                                                          HANDLE ProcessHandle, ULONG_PTR ZeroBits,
-                                                          PVOID BaseAddress, SIZE_T RegionSize,
-                                                          ULONG AllocationType, ULONG Protect) {
-        void*    result = BaseAddress;
-        size_t   resultSize = RegionSize;
-        NTSTATUS status = dll.m_NtAllocateVirtualMemory(ProcessHandle, &result, ZeroBits,
-                                                        &resultSize, AllocationType, Protect);
-        if (status != STATUS_SUCCESS)
-            throw NtStatusError(dll.ntdll(), "NtAllocateVirtualMemory", status);
-        return {result, resultSize};
+    static void* virtualAlloc(PVOID BaseAddress, SIZE_T RegionSize, ULONG AllocationType,
+                              ULONG Protect) {
+        void* result = VirtualAlloc(BaseAddress, RegionSize, AllocationType, Protect);
+        if (!result)
+            throw LastError();
+        return result;
     }
     void free() {
         if (m_address) {
-            size_t   size = 0;
-            NTSTATUS status =
-                m_dll.m_NtFreeVirtualMemory(m_process, &m_address, &size, MEM_RELEASE);
-            if (status != STATUS_SUCCESS)
-                NtStatusError(m_dll.ntdll(), "NtFreeVirtualMemory", status)
-                    .print(); // can't throw from destructor. ignore the error
+            // Size must be zero for MEM_RELEASE. Print instead of throw/terminate from destructor
+            if (!VirtualFree(m_address, 0, MEM_RELEASE))
+                LastError().print();
         }
     }
     void* offsetAddress(SIZE_T Offset) const {
         return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(m_address) + Offset);
     }
-    const NtifsSection& m_dll;
-    HANDLE              m_process = INVALID_HANDLE_VALUE;
-    void*               m_address = nullptr;
+    void* m_address = nullptr;
 };
 
 static HANDLE createSection(const NtifsSection& dll, ACCESS_MASK DesiredAccess,
@@ -641,8 +622,7 @@ class ResizableMappedMemory {
 public:
     ResizableMappedMemory(size_t initialSize, size_t maxSize)
         : m_capacity(maxSize)
-        , m_memory(ntifs(), NtifsSection::CurrentProcess(), 0, m_capacity, MEM_RESERVE,
-                   PAGE_NOACCESS) {
+        , m_memory(m_capacity, MEM_RESERVE, PAGE_NOACCESS) {
         if (initialSize)
             resize(initialSize);
     }
@@ -650,8 +630,8 @@ public:
     size_t size() const { return m_size; }
     size_t capacity() const { return m_capacity; }
     void   resize(size_t size) {
-        // Artificially fail on overflow. The NtAllocateVirtualMemory() call succeeds without error,
-        // but the memory becomes unreadable afterwards.
+        // Artificially fail on overflow. The original NtAllocateVirtualMemory() call would
+        // succeed without error, but the memory becomes unreadable afterwards.
         if (size > m_capacity)
             throw std::bad_alloc();
 
@@ -661,7 +641,7 @@ public:
 
         // Add/remove just the new range
         if (newMappedSize > m_mappedSize)
-            m_memory.commit(0, m_mappedSize, newMappedSize - m_mappedSize, PAGE_READWRITE);
+            m_memory.commit(m_mappedSize, newMappedSize - m_mappedSize, PAGE_READWRITE);
         else if (newMappedSize < m_mappedSize)
             m_memory.decommit(newMappedSize, m_mappedSize - newMappedSize);
         m_mappedSize = newMappedSize;
