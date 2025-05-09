@@ -254,72 +254,36 @@ public:
     ResizableMappedMemory(ResizableMappedMemory&& other) noexcept = default;
     ResizableMappedMemory(size_t initialSize, size_t maxSize)
         : m_reserved(nullptr, maxSize, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) {
-        if (initialSize)
-            map(initialSize);
+        resize(initialSize);
     }
     ResizableMappedMemory& operator=(const ResizableMappedMemory& other) = delete;
     void*                  data() const { return m_size ? m_reserved.address() : nullptr; }
     size_t                 size() const { return m_size; }
     size_t                 capacity() const { return m_reserved.size(); }
     void                   resize(size_t size) {
-        size = throwIfAbove(size, m_reserved.size());
-        if (size)
-            map(size);
+        if (size > capacity())
+            throw std::bad_alloc();
+
+        // Align to the next page boundary
+        size_t ps = pageSize();
+        size_t newMappedSize = ((size + ps - 1) / ps) * ps;
+
+        // Add/remove just the new range
+        if (newMappedSize > m_mappedSize)
+            protect(m_mappedSize, newMappedSize - m_mappedSize, PROT_READ | PROT_WRITE);
+        else if (newMappedSize < m_mappedSize)
+            protect(newMappedSize, m_mappedSize - newMappedSize, PROT_NONE);
+        m_mappedSize = newMappedSize;
+        m_size = size;
     }
 
     ResizableMappedMemory& operator=(ResizableMappedMemory&& other) noexcept = default;
 
 private:
-    void map(size_t size) {
-        // TODO: if m_mapped shrinks, does m_reserved instead need to be
-        // recreated to fill the gap?
-        size_t ps = pageSize();
-        size_t mappedSize = ((size + ps - 1) / ps) * ps; // TODO: cache?
-        if (mappedSize == 0) {
-            // Cannot move, as it's reserved, and we throw if we try to exceed.
-            if (mmap(const_cast<void*>(m_reserved.address()), mappedSize, PROT_READ | PROT_WRITE,
-                     MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) {
-                throw LastError();
-            }
-        } else {
-#if 1
-            // Map any additional pages needed. Don't remap existing pages or
-            // they get zeroed. Another idea might be a memory fd.
-            if (mappedSize > m_mappedSize) {
-                // Cannot move, as it's reserved, and we throw if we try to exceed.
-                if (mmap(reinterpret_cast<void*>(uintptr_t(m_reserved.address()) + m_mappedSize),
-                         mappedSize - m_mappedSize, PROT_READ | PROT_WRITE,
-                         MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED)
-                    throw LastError();
-                m_mappedSize = mappedSize;
-            }
-#else
-    #if 1
-            // Remap? Specs say old and new addresses cannot be the same,
-            // although it only errors out when remapping more than a page.
-            void* addr =
-                mremap(m_reserved.address(), m_size, size,
-                       MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP, m_reserved.address());
-    #else
-            // Remap without MREMAP_FIXED - immediately fails because it can't
-            // replace the reserved mapping.
-            void* addr = mremap(m_reserved.address(), m_size, size, 0);
-    #endif
-            if (addr == MAP_FAILED) {
-                throw LastError();
-            } else if (addr != m_reserved.address()) {
-                // Unrecoverable
-                fprintf(stderr, "fatal: mremap() moved the mapping");
-                std::terminate();
-            }
-#endif
-        }
-        m_size = size;
-    }
-    static size_t throwIfAbove(size_t v, size_t limit) {
-        if (v > limit)
-            throw std::bad_alloc();
-        return v;
+    void protect(size_t offset, size_t size, int prot) {
+        if (mprotect(reinterpret_cast<void*>(uintptr_t(m_reserved.address()) + offset), size,
+                     prot) != 0)
+            throw LastError();
     }
     detail::MemoryMap<PROT_NONE> m_reserved;
     size_t                       m_size = 0;
