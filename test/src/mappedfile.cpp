@@ -26,7 +26,21 @@ protected:
 
 TEST_F(MappedFileFixture, ReadOnly) {
     file mapped(m_tmpFile);
-    EXPECT_EQ(*reinterpret_cast<const int*>(mapped.data()), 42);
+    EXPECT_EQ(*static_cast<const int*>(mapped.data()), 42);
+}
+
+TEST_F(MappedFileFixture, Writable) {
+    {
+        writable_file mapped(m_tmpFile);
+        ASSERT_GE(mapped.size(), sizeof(int));
+        *static_cast<int*>(mapped.data()) = 123;
+    }
+    {
+        std::ifstream ifile(m_tmpFile, std::ios::binary);
+        int           contents;
+        ifile.read(reinterpret_cast<char*>(&contents), sizeof(contents));
+        EXPECT_EQ(contents, 123);
+    }
 }
 
 #ifdef _WIN32

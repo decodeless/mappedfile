@@ -174,8 +174,8 @@ public:
                  FILE_SHARE_READ | (Writable ? FILE_SHARE_WRITE : 0), nullptr, OPEN_EXISTING,
                  FILE_ATTRIBUTE_NORMAL, nullptr)
         , m_size(m_file.size())
-        , m_mapping(m_file, nullptr, PAGE_READONLY, m_size, nullptr)
-        , m_rawView(m_mapping, FILE_MAP_READ) {}
+        , m_mapping(m_file, nullptr, Writable ? PAGE_READWRITE : PAGE_READONLY, m_size, nullptr)
+        , m_rawView(m_mapping, FILE_MAP_READ | (Writable ? FILE_MAP_WRITE : 0)) {}
     data_type data() const { return m_rawView.address(); }
     size_t    size() const { return m_size; }
 

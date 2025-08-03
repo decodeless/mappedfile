@@ -182,9 +182,9 @@ template <bool Writable>
 class MappedFile {
 public:
     using data_type = std::conditional_t<Writable, void*, const void*>;
-    MappedFile(const fs::path& path, int mapFlags = MAP_PRIVATE)
+    MappedFile(const fs::path& path)
         : m_file(path, Writable ? O_RDWR : O_RDONLY)
-        , m_mapped(nullptr, m_file.size(), mapFlags, m_file, 0) {}
+        , m_mapped(nullptr, m_file.size(), Writable ? MAP_SHARED : MAP_PRIVATE, m_file, 0) {}
 
     data_type data() const { return m_mapped.address(); }
     size_t    size() const { return m_mapped.size(); }
