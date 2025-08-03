@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Pyarelal Knowles, MIT License
+// Copyright (c) 2024-2025 Pyarelal Knowles, MIT License
 
 #include <algorithm>
 #include <cstdio>
@@ -36,6 +36,21 @@ TEST_F(MappedFileFixture, Writable) {
         *static_cast<int*>(mapped.data()) = 123;
     }
     {
+        std::ifstream ifile(m_tmpFile, std::ios::binary);
+        int           contents;
+        ifile.read(reinterpret_cast<char*>(&contents), sizeof(contents));
+        EXPECT_EQ(contents, 123);
+    }
+}
+
+TEST_F(MappedFileFixture, WritableSync) {
+    writable_file mapped(m_tmpFile);
+    ASSERT_GE(mapped.size(), sizeof(int));
+    *static_cast<int*>(mapped.data()) = 123;
+    mapped.sync();
+    {
+        // This test will always pass even without the .sync() as it just reads the same pages in
+        // memory
         std::ifstream ifile(m_tmpFile, std::ios::binary);
         int           contents;
         ifile.read(reinterpret_cast<char*>(&contents), sizeof(contents));
@@ -417,6 +432,28 @@ TEST_F(MappedFileFixture, ResizableFileSize) {
         lastSize = size;
     }
     EXPECT_EQ(fs::file_size(m_tmpFile), lastSize);
+}
+
+TEST_F(MappedFileFixture, ResizableFileSync) {
+    resizable_file file(m_tmpFile, 10000);
+    size_t         sizes[] = {1, 2, 4000, 4095, 4096, 4097, 10000, 1, 4097, 4096, 4095, 42};
+    for (size_t size : sizes) {
+        file.resize(size);
+        static_cast<char*>(file.data())[size - 1] = '*';
+        file.sync(size - 1, 1);
+        {
+            // This is pointless because we're just reading the same pages, whether they're flushed
+            // to disk or not. Tried reading metadata like std::filesystem::last_write_time, but not
+            // reliable enough for testing.
+            std::ifstream ifile(m_tmpFile, std::ios::binary);
+            char          c;
+            ifile.seekg(size - 1);
+            ifile.read(&c, 1);
+            EXPECT_EQ(c, '*');
+        }
+        static_cast<char*>(file.data())[size - 1] = '_';
+        file.sync();
+    }
 }
 
 TEST_F(MappedFileFixture, Readme) {

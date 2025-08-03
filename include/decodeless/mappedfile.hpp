@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Pyarelal Knowles, MIT License
+// Copyright (c) 2024-2025 Pyarelal Knowles, MIT License
 
 // Inspiration:
 // - https://nfrechette.github.io/2015/06/11/vmem_linear_allocator/
@@ -18,7 +18,9 @@
 
 namespace decodeless {
 
-// May throw std::bad_alloc or std::runtime_error (mapped_file_error or
+// These types are provided by the platform specific implementations included
+// above. Below are C++ concepts to verify a common interface. Constructors may
+// throw std::bad_alloc or std::runtime_error (mapped_file_error or
 // mapping_error)
 using file = detail::MappedFile<false>;
 using writable_file = detail::MappedFile<true>;
@@ -41,6 +43,8 @@ concept writable_mapped_file =
     std::is_constructible_v<T, fs::path> && move_only<T> && requires(T t) {
         { t.data() } -> std::same_as<void*>;
         { t.size() } -> std::same_as<size_t>;
+        { t.sync() } -> std::same_as<void>;
+        { t.sync(std::declval<size_t>(), std::declval<size_t>()) } -> std::same_as<void>;
     };
 
 template <class T>
@@ -51,9 +55,15 @@ concept resizable_mapped_memory = move_only<T> && requires(T t) {
     { t.resize(std::declval<size_t>()) } -> std::same_as<void>;
 };
 
+template <class T>
+concept resizable_mapped_file = resizable_mapped_memory<T> && requires(T t) {
+    { t.sync() } -> std::same_as<void>;
+    { t.sync(std::declval<size_t>(), std::declval<size_t>()) } -> std::same_as<void>;
+};
+
 static_assert(mapped_file<file>);
 static_assert(writable_mapped_file<writable_file>);
-static_assert(resizable_mapped_memory<resizable_file>);
+static_assert(resizable_mapped_file<resizable_file>);
 static_assert(std::is_constructible_v<resizable_file, fs::path, size_t>);
 static_assert(resizable_mapped_memory<resizable_memory>);
 static_assert(std::is_constructible_v<resizable_memory, size_t, size_t>);

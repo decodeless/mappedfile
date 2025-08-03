@@ -1,13 +1,14 @@
 # decodeless_mappedfile
 
-[`decodeless`](https://github.com/decodeless) (previously no-decode) is a
-collection of utility libraries for conveniently reading and writing files via
-memory mapping. Components can be used individually or combined.
+[`decodeless`](https://github.com/decodeless) is a collection of utility
+libraries for conveniently reading and writing files via memory mapping.
+Components can be used individually or combined.
 
-`decodeless_mappedfile` is a small cross platform file mapping abstraction that
-supports reserving virtual address space and growing a file mapping into it for
-an exciting new way to write binary files. Also includes convenient read-only
-and writable file mapping objects.
+`decodeless_mappedfile` is a small cross platform file mapping abstraction. It
+provides simple objects to read and write to existing files. However, the more
+interesting feature is a resizable mapped file. It works by reserving some
+virtual address space and growing a file mapping into it for a really convenient
+and fast way to write binary files.
 
 [decodeless_writer](https://github.com/decodeless/writer) conbines this and
 [decodeless_allocator](https://github.com/decodeless/allocator) to conveniently
@@ -33,16 +34,16 @@ write complex data structures directly as binary data.
 
 ## Code Example
 
-```
+```cpp
 // Memory map a read-only file
 decodeless::file mapped(filename);
 const int* numbers = reinterpret_cast<const int*>(mapped.data());
 ...
 ```
 
-```
+```cpp
 // Create a file
-size_t maxSize = 4096;
+size_t maxSize = 1 << 30;  // reserved virtual address; can be huge
 decodeless::resizable_file file(filename, maxSize);
 EXPECT_EQ(file.size(), 0);
 EXPECT_EQ(file.data(), nullptr);
@@ -56,6 +57,35 @@ numbers[9] = 9;
 file.resize(sizeof(int) * 100);
 EXPECT_EQ(numbers[9], 9);
 numbers[99] = 99;
+```
+
+## Building
+
+This is a header-only C++20 library with CMake integration. Use any of:
+
+- ```cmake
+  add_subdirectory(path/to/mappedfile)
+  ```
+
+- ```cmake
+  include(FetchContent)
+  FetchContent_Declare(
+      decodeless_mappedfile
+      GIT_REPOSITORY https://github.com/decodeless/mappedfile.git
+      GIT_TAG release_tag
+      GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(decodeless_mappedfile)
+  ```
+
+- ```cmake
+  find_package(decodeless_mappedfile REQUIRED CONFIG PATHS paths/to/search)
+  ```
+
+Then,
+
+```cmake
+target_link_libraries(myproject PRIVATE decodeless::mappedfile)
 ```
 
 ## Notes

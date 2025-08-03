@@ -1,4 +1,4 @@
-# Copyright (c) 2024 Pyarelal Knowles, MIT License
+# Copyright (c) 2024-2025 Pyarelal Knowles, MIT License
 
 cmake_minimum_required(VERSION 3.20)
 

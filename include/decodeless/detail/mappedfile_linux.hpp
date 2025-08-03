@@ -1,15 +1,16 @@
-// Copyright (c) 2024 Pyarelal Knowles, MIT License
+// Copyright (c) 2024-2025 Pyarelal Knowles, MIT License
 
 #pragma once
 
+#include <assert.h>
 #include <decodeless/detail/mappedfile_common.hpp>
 #include <errno.h>
 #include <exception>
 #include <fcntl.h>
 #include <limits>
+#include <optional>
 #include <string.h>
 #include <string>
-#include <optional>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -128,14 +129,25 @@ public:
         return static_cast<address_type>(static_cast<byte_type*>(m_address) + offset);
     }
     size_t       size() const { return m_size; }
-    void         sync(int flags = MS_SYNC | MS_INVALIDATE)
+    void         sync(size_t offset, size_t size) const
+        requires Writable
+    {
+        assert(offset + size <= m_size);
+        size_t alignedOffset = offset & ~(pageSize() - 1);
+        size_t alignedSize = size + offset - alignedOffset;
+        void*  offsetAddress = static_cast<void*>(
+            static_cast<std::byte*>(const_cast<void*>(m_address)) + alignedOffset);
+        if (msync(offsetAddress, alignedSize, MS_SYNC | MS_INVALIDATE) == -1)
+            throw LastError();
+    }
+    void sync() const
         requires Writable
     {
         // ENOMEM "Cannot allocate memory" here likely means something remapped
         // the range before this object went out of scope. I haven't found a
         // good way to avoid this other than the user being careful to delete
         // the object before remapping.
-        if (msync(const_cast<void*>(m_address), m_size, flags) == -1)
+        if (msync(const_cast<void*>(m_address), m_size, MS_SYNC | MS_INVALIDATE) == -1)
             throw LastError();
     }
     void resize(size_t size) {
@@ -188,6 +200,16 @@ public:
 
     data_type data() const { return m_mapped.address(); }
     size_t    size() const { return m_mapped.size(); }
+    void      sync() const
+        requires Writable
+    {
+        m_mapped.sync();
+    }
+    void sync(size_t offset, size_t size) const
+        requires Writable
+    {
+        m_mapped.sync(offset, size);
+    }
 
 private:
     static constexpr int MapMemoryProtection = Writable ? PROT_READ | PROT_WRITE : PROT_READ;
@@ -217,6 +239,14 @@ public:
         m_file.truncate(size);
         if (size)
             map(size);
+    }
+    void sync() const {
+        if (m_mapped)
+            m_mapped->sync();
+    }
+    void sync(size_t offset, size_t size) const {
+        if (m_mapped)
+            m_mapped->sync(offset, size);
     }
 
     // Override default move assignment so m_reserved outlives m_mapped

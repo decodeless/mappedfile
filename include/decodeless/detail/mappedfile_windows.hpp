@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Pyarelal Knowles, MIT License
+// Copyright (c) 2024-2025 Pyarelal Knowles, MIT License
 
 #pragma once
 
@@ -104,6 +104,10 @@ public:
             throw LastError();
         return result.QuadPart;
     }
+    void flush() const {
+        if (!FlushFileBuffers(*this))
+            throw LastError();
+    }
 };
 
 class FileMappingHandle : public Handle {
@@ -157,8 +161,13 @@ public:
     void*                    address() const { return m_address; }
     MEMORY_BASIC_INFORMATION query() const {
         MEMORY_BASIC_INFORMATION result;
-        (void)VirtualQuery(address(), &result, sizeof(result));
+        (void)VirtualQuery(m_address, &result, sizeof(result));
         return result;
+    }
+    void flush(size_t offset = 0, size_t bytes = 0) const {
+        if (!FlushViewOfFile(
+                static_cast<LPCVOID>(static_cast<const std::byte*>(m_address) + offset), bytes))
+            throw LastError();
     }
 
 private:
@@ -178,6 +187,19 @@ public:
         , m_rawView(m_mapping, FILE_MAP_READ | (Writable ? FILE_MAP_WRITE : 0)) {}
     data_type data() const { return m_rawView.address(); }
     size_t    size() const { return m_size; }
+    void      sync() const
+        requires Writable
+    {
+        m_rawView.flush(); // async flush pages of whole mapping
+        m_file.flush();    // flush metadata and wait
+    }
+    void sync(size_t offset, size_t bytes) const
+        requires Writable
+    {
+        assert(offset + bytes <= m_size);
+        m_rawView.flush(offset, bytes); // async flush pages of range
+        m_file.flush();                 // flush metadata and wait
+    }
 
 private:
     FileHandle        m_file;
@@ -243,6 +265,7 @@ private:
 // DANGER: copy/pasting from e.g.
 // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntcreatesection and
 // http://undocumented.ntinternals.net/index.html?page=UserMode%2FUndocumented%20Functions%2FNT%20Objects%2FSection%2FNtMapViewOfSection.html
+// There are a number of differences, mostly involving ULONG -> SIZE_T upgrades for 64 bit
 // TODO: make WDK a dependency? ugh..
 // *dumpbin.exe /EXPORTS Windows/System32/ntdll.dll to verify symbols exist
 
@@ -285,6 +308,14 @@ typedef struct _SECTION_IMAGE_INFORMATION {
     ULONG Unknown2[3];
 } SECTION_IMAGE_INFORMATION, *PSECTION_IMAGE_INFORMATION;
 
+typedef struct _IO_STATUS_BLOCK {
+    union {
+        NTSTATUS Status;
+        PVOID    Pointer;
+    };
+    ULONG_PTR Information;
+} IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
+
 using NtAllocateVirtualMemoryType = NTSTATUS(HANDLE ProcessHandle, PVOID* BaseAddress,
                                              ULONG_PTR ZeroBits, PSIZE_T RegionSize,
                                              ULONG AllocationType, ULONG Protect);
@@ -293,6 +324,9 @@ using NtCreateSectionType = NTSTATUS(PHANDLE SectionHandle, ACCESS_MASK DesiredA
                                      PLARGE_INTEGER MaximumSize, ULONG SectionPageProtection,
                                      ULONG AllocationAttributes, HANDLE FileHandle);
 using NtExtendSectionType = NTSTATUS(HANDLE SectionHandle, PLARGE_INTEGER NewSectionSize);
+using NtFlushVirtualMemoryType = NTSTATUS(HANDLE ProcessHandle, PVOID* BaseAddress,
+                                          PSIZE_T          NumberOfBytesToFlush,
+                                          PIO_STATUS_BLOCK IoStatusBlock);
 using NtFreeVirtualMemoryType = NTSTATUS(HANDLE ProcessHandle, PVOID* BaseAddress,
                                          PSIZE_T RegionSize, ULONG FreeType);
 using NtMapViewOfSectionType = NTSTATUS(HANDLE SectionHandle, HANDLE ProcessHandle,
@@ -305,8 +339,8 @@ using NtOpenSectionType = NTSTATUS(PHANDLE SectionHandle, ACCESS_MASK DesiredAcc
 using NtCloseType = NTSTATUS(HANDLE Handle);
 using NtQuerySectionType = NTSTATUS(HANDLE                    SectionHandle,
                                     SECTION_INFORMATION_CLASS InformationClass,
-                                    PVOID InformationBuffer, ULONG InformationBufferSize,
-                                    PULONG ResultLength);
+                                    PVOID InformationBuffer, SIZE_T InformationBufferSize,
+                                    PSIZE_T ResultLength);
 using NtUnmapViewOfSectionType = NTSTATUS(HANDLE ProcessHandle, PVOID BaseAddress);
 
 class NtStatusError : public mapping_error {
@@ -323,6 +357,7 @@ public:
               m_ntdll.get<NtAllocateVirtualMemoryType>("NtAllocateVirtualMemory"))
         , m_NtCreateSection(m_ntdll.get<NtCreateSectionType>("NtCreateSection"))
         , m_NtExtendSection(m_ntdll.get<NtExtendSectionType>("NtExtendSection"))
+        , m_NtFlushVirtualMemory(m_ntdll.get<NtFlushVirtualMemoryType>("NtFlushVirtualMemory"))
         , m_NtFreeVirtualMemory(m_ntdll.get<NtFreeVirtualMemoryType>("NtFreeVirtualMemory"))
         , m_NtMapViewOfSection(m_ntdll.get<NtMapViewOfSectionType>("NtMapViewOfSection"))
         , m_NtOpenSection(m_ntdll.get<NtOpenSectionType>("NtOpenSection"))
@@ -340,6 +375,7 @@ public:
     NtAllocateVirtualMemoryType* const m_NtAllocateVirtualMemory;
     NtCreateSectionType* const         m_NtCreateSection;
     NtExtendSectionType* const         m_NtExtendSection;
+    NtFlushVirtualMemoryType* const    m_NtFlushVirtualMemory;
     NtFreeVirtualMemoryType* const     m_NtFreeVirtualMemory;
     NtMapViewOfSectionType* const      m_NtMapViewOfSection;
     NtOpenSectionType* const           m_NtOpenSection;
@@ -391,6 +427,7 @@ public:
         assert(RegionSize != 0);
         assert(Offset % pageSizeCached() == 0);
         assert(RegionSize % pageSizeCached() == 0);
+#pragma warning(suppress : 6250) // intentionally decommit without releasing the address space
         if (!VirtualFree(offsetAddress(Offset), RegionSize, MEM_DECOMMIT))
             throw LastError();
     }
@@ -412,7 +449,7 @@ private:
         }
     }
     void* offsetAddress(SIZE_T Offset) const {
-        return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(m_address) + Offset);
+        return static_cast<void*>(static_cast<std::byte*>(m_address) + Offset);
     }
     void* m_address = nullptr;
 };
@@ -431,14 +468,14 @@ static HANDLE createSection(const NtifsSection& dll, ACCESS_MASK DesiredAccess,
     return result;
 }
 
-template <ULONG SectionPageProtection>
+template <ULONG PageProtection>
 class Section : public Handle {
 public:
     Section(Section&& other) noexcept = default;
     Section(const NtifsSection& dll, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
             size_t MaximumSize, ULONG AllocationAttributes, HANDLE FileHandle)
-        : Handle(createSection(dll, DesiredAccess, ObjectAttributes, MaximumSize,
-                               SectionPageProtection, AllocationAttributes, FileHandle))
+        : Handle(createSection(dll, DesiredAccess, ObjectAttributes, MaximumSize, PageProtection,
+                               AllocationAttributes, FileHandle))
         , m_dll(dll)
         , m_size(MaximumSize) {}
     Section& operator=(Section&& other) noexcept {
@@ -462,7 +499,7 @@ public:
 
     SECTION_BASIC_INFORMATION queryBasic() const {
         SECTION_BASIC_INFORMATION result;
-        ULONG                     written{};
+        PSIZE_T                   written{};
         NTSTATUS status = m_dll.m_NtQuerySection(*this, SectionBasicInformation, &result,
                                                  sizeof(result), &written);
         if (status != STATUS_SUCCESS)
@@ -472,7 +509,7 @@ public:
 
     SECTION_IMAGE_INFORMATION queryImage() const {
         SECTION_IMAGE_INFORMATION result;
-        ULONG                     written{};
+        PSIZE_T                   written{};
         NTSTATUS status = m_dll.m_NtQuerySection(*this, SectionImageInformation, &result,
                                                  sizeof(result), &written);
         if (status != STATUS_SUCCESS)
@@ -488,23 +525,23 @@ private:
 static_assert(std::is_move_constructible_v<Section<PAGE_READWRITE>>);
 static_assert(std::is_move_assignable_v<Section<PAGE_READWRITE>>);
 
-template <ULONG SectionPageProtection>
+template <ULONG PageProtection>
 class SectionView {
 public:
     static constexpr bool writable =
-        (SectionPageProtection &
+        (PageProtection &
          (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
     using address_type = std::conditional_t<writable, void*, const void*>;
     SectionView() = delete;
     SectionView(const SectionView& other) = delete;
-    SectionView(const NtifsSection& dll, const Section<SectionPageProtection>& Section,
+    SectionView(const NtifsSection& dll, const Section<PageProtection>& Section,
                 HANDLE ProcessHandle, ULONG_PTR ZeroBits, size_t CommitSize, size_t SectionOffset,
                 size_t ViewSize, SECTION_INHERIT InheritDisposition, ULONG AllocationType)
         : m_dll(dll)
         , m_process(ProcessHandle)
         , m_address(mapViewOfSection(dll, Section, ProcessHandle, ZeroBits, CommitSize,
                                      SectionOffset, ViewSize, InheritDisposition, AllocationType,
-                                     SectionPageProtection)) {}
+                                     PageProtection)) {}
     ~SectionView() {
         if (m_address)
             unmap();
@@ -530,6 +567,18 @@ public:
         (void)VirtualQuery(reinterpret_cast<std::byte*>(address()) + offset, &result,
                            sizeof(result));
         return result;
+    }
+    void flush(size_t offset, size_t bytes) const
+        requires writable
+    {
+        address_type mutAddress =
+            static_cast<address_type>(static_cast<std::byte*>(m_address) + offset);
+        SIZE_T          mutBytes = bytes;
+        IO_STATUS_BLOCK statusBlock; // ignored
+        NTSTATUS        status =
+            m_dll.m_NtFlushVirtualMemory(m_process, &mutAddress, &mutBytes, &statusBlock);
+        if (status != STATUS_SUCCESS)
+            throw NtStatusError(m_dll.ntdll(), "NtFlushVirtualMemory", status);
     }
 
 private:
@@ -607,6 +656,19 @@ public:
                              ViewUnmap, MEM_RESERVE);
         }
     }
+    void sync() const {
+        if (m_view && m_section) {
+            m_view->flush(0, m_section->size()); // async flush pages of whole mapping
+            m_file.flush();                      // flush metadata and wait
+        }
+    }
+    void sync(size_t offset, size_t bytes) const {
+        assert(offset + bytes <= size());
+        if (m_view) {
+            m_view->flush(offset, bytes); // async flush pages of range
+            m_file.flush();               // flush metadata and wait
+        }
+    }
 
 private:
     size_t                                     m_capacity = 0;
@@ -649,10 +711,6 @@ public:
     }
 
 private:
-    static NtifsSection& ntifs() {
-        static NtifsSection ntifs;
-        return ntifs;
-    }
     size_t        m_capacity = 0;
     size_t        m_size = 0;
     size_t        m_mappedSize = 0;
