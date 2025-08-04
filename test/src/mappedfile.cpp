@@ -1,10 +1,11 @@
 // Copyright (c) 2024 Pyarelal Knowles, MIT License
 
+#include <algorithm>
 #include <cstdio>
+#include <decodeless/mappedfile.hpp>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
-#include <decodeless/mappedfile.hpp>
 #include <ostream>
 #include <span>
 
@@ -226,7 +227,7 @@ TEST_F(MappedFileFixture, LinuxResize) {
 
 #endif
 
-TEST_F(MappedFileFixture, ResizeMemory) {
+TEST(MappedMemory, ResizeMemory) {
     const char str[] = "hello world!";
     {
         resizable_memory file(0, 10000);
@@ -270,7 +271,7 @@ TEST_F(MappedFileFixture, ResizeMemory) {
     }
 }
 
-TEST_F(MappedFileFixture, ResizeMemoryExtended) {
+TEST(MappedMemory, ResizeMemoryExtended) {
     size_t           nextBytes = 1;
     resizable_memory memory(nextBytes, 1llu << 32); // 4gb of virtual memory pls
     void*            data = memory.data();
@@ -425,3 +426,58 @@ TEST_F(MappedFileFixture, Readme) {
     fs::remove(tmpFile2);
     EXPECT_FALSE(fs::exists(tmpFile2));
 }
+
+#ifndef _WIN32
+std::vector<uint8_t> getResidency(void* base, size_t size) {
+    std::vector<unsigned char> result(size / getpagesize(), 0u);
+    int                        ret = mincore(base, size, result.data());
+    if (ret != 0)
+        throw detail::LastError();
+    return result;
+}
+
+TEST(MappedMemory, PageResidencyAfterDecommit) {
+    const size_t page_size = getpagesize();
+    const size_t reserve_size = page_size * 64; // 64 pages total
+    const size_t commit_size = page_size * 4;   // We'll use 4 pages
+
+    // Reserve virtual address space (uncommitted, inaccessible)
+    void* base =
+        mmap(nullptr, reserve_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    ASSERT_NE(base, MAP_FAILED) << "Failed to mmap reserved space";
+    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
+                                    [](uint8_t c) { return (c & 1u) == 0; }));
+
+    // Commit a portion with PROT_READ | PROT_WRITE
+    int prot_result = mprotect(base, commit_size, PROT_READ | PROT_WRITE);
+    ASSERT_EQ(prot_result, 0) << "Failed to mprotect committed region";
+    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
+                                    [](uint8_t c) { return (c & 1u) == 0; }));
+
+    // Touch the memory to ensure it's backed by RAM
+    std::span committed(static_cast<std::byte*>(base), commit_size);
+    std::ranges::fill(committed, std::byte(0xAB));
+
+    // Verify pages are resident using mincore
+    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
+                                    [](uint8_t c) { return (c & 1u) == 1; }));
+
+    // Decommit
+    #if 0
+    void* remap = mmap(base, commit_size, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    ASSERT_EQ(remap, base) << "Failed to remap to decommit pages";
+    #else
+    // See MADV_FREE discussion here: https://github.com/golang/go/issues/42330
+    prot_result = mprotect(base, commit_size, PROT_NONE);
+    ASSERT_EQ(prot_result, 0) << "Failed to mprotect committed region back to PROT_NONE";
+    int madvise_result = madvise(base, commit_size, MADV_DONTNEED);
+    ASSERT_EQ(madvise_result, 0) << "Failed to release pages with madvise";
+    #endif
+    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
+                                    [](uint8_t c) { return (c & 1u) == 0; }));
+
+    // Cleanup
+    munmap(base, reserve_size);
+}
+#endif

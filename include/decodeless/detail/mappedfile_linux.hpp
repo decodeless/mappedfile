@@ -88,6 +88,7 @@ public:
     static constexpr bool ProtNone = MemoryProtection == PROT_NONE;
     static constexpr bool Writable = (MemoryProtection & PROT_WRITE) != 0;
     using address_type = std::conditional_t<Writable || ProtNone, void*, const void*>;
+    using byte_type = std::conditional_t<Writable || ProtNone, std::byte, const std::byte>;
     MemoryMap(address_type addr, size_t length, int flags, int fd, off_t offset)
         : m_size(length)
         , m_address(mmap(const_cast<void*>(addr), length, MemoryProtection, flags, fd, offset))
@@ -123,6 +124,9 @@ public:
         unmap();
     }
     address_type address() const { return m_address; }
+    address_type address(size_t offset) const {
+        return static_cast<address_type>(static_cast<byte_type*>(m_address) + offset);
+    }
     size_t       size() const { return m_size; }
     void         sync(int flags = MS_SYNC | MS_INVALIDATE)
         requires Writable
@@ -135,12 +139,7 @@ public:
             throw LastError();
     }
     void resize(size_t size) {
-#if 0
-        void* addr = mremap(m_address, m_size, size,
-                            MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP, m_address);
-#else
         void* addr = mremap(m_address, m_size, size, 0);
-#endif
         if (addr == MAP_FAILED) {
             throw LastError();
         } else if (addr != m_address) {
@@ -268,11 +267,27 @@ public:
         size_t ps = pageSize();
         size_t newMappedSize = ((size + ps - 1) / ps) * ps;
 
-        // Add/remove just the new range
-        if (newMappedSize > m_mappedSize)
-            protect(m_mappedSize, newMappedSize - m_mappedSize, PROT_READ | PROT_WRITE);
-        else if (newMappedSize < m_mappedSize)
-            protect(newMappedSize, m_mappedSize - newMappedSize, PROT_NONE);
+        if (newMappedSize > m_mappedSize) {
+            // Add just the new range
+            if (mprotect(m_reserved.address(m_mappedSize), newMappedSize - m_mappedSize,
+                         PROT_READ | PROT_WRITE) != 0)
+                throw LastError();
+        } else if (newMappedSize < m_mappedSize) {
+            // Release unused range to the OS. mprotect() will not do this.
+            // Using MADV_DONTNEED is many times faster than mmap().
+#if 1
+            if (mprotect(m_reserved.address(newMappedSize), m_mappedSize - newMappedSize,
+                         PROT_NONE) != 0)
+                throw LastError();
+            if (madvise(m_reserved.address(newMappedSize), m_mappedSize - newMappedSize,
+                        MADV_DONTNEED) != 0)
+                throw LastError();
+#else
+            if (mmap(m_reserved.address(newMappedSize), m_mappedSize - newMappedSize, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) == MAP_FAILED)
+                throw LastError();
+#endif
+        }
         m_mappedSize = newMappedSize;
         m_size = size;
     }
@@ -280,11 +295,6 @@ public:
     ResizableMappedMemory& operator=(ResizableMappedMemory&& other) noexcept = default;
 
 private:
-    void protect(size_t offset, size_t size, int prot) {
-        if (mprotect(reinterpret_cast<void*>(uintptr_t(m_reserved.address()) + offset), size,
-                     prot) != 0)
-            throw LastError();
-    }
     detail::MemoryMap<PROT_NONE> m_reserved;
     size_t                       m_size = 0;
     size_t                       m_mappedSize = 0;
