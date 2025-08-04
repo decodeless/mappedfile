@@ -93,6 +93,9 @@ target_link_libraries(myproject PRIVATE decodeless::mappedfile)
 - Windows implementation uses unofficial section API for `NtExtendSection` from
   `wdm.h`/`ntdll.dll`/"WDK". Please leave a comment if you know of an
   alternative. It works well, but technically could change at any time.
+- Linux `resizable_file` maps more than the file size and truncates without
+  remapping. Simple and very fast, although not explicitly supported in the man
+  pages. Tests indicate the right thing still happens.
 
 ## Contributing
 

@@ -66,7 +66,7 @@ TEST_F(MappedFileFixture, FileHandle) {
     EXPECT_TRUE(file); // a bit pointless - would have thrown if not
 }
 
-TEST_F(MappedFileFixture, Create) {
+TEST(MappedFile, Create) {
     fs::path tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
     EXPECT_FALSE(fs::exists(tmpFile2));
     if (fs::exists(tmpFile2))
@@ -93,7 +93,7 @@ TEST_F(MappedFileFixture, Create) {
     EXPECT_FALSE(fs::exists(tmpFile2));
 }
 
-TEST_F(MappedFileFixture, Reserve) {
+TEST(MappedFile, Reserve) {
     fs::path tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
     {
         // Create a new file
@@ -154,7 +154,28 @@ TEST_F(MappedFileFixture, LinuxFileDescriptor) {
     EXPECT_NE(fd, -1);
 }
 
-TEST_F(MappedFileFixture, LinuxCreate) {
+TEST_F(MappedFileFixture, LinuxOvermapResizeWrite) {
+    size_t overmapSize = 1024 * 1024;
+    EXPECT_EQ(fs::file_size(m_tmpFile), sizeof(int));
+    {
+        detail::FileDescriptor fd(m_tmpFile, O_RDWR);
+        detail::MemoryMapRW    mapped(nullptr, overmapSize, MAP_SHARED, fd, 0);
+        fd.truncate(overmapSize);
+
+        std::span data(reinterpret_cast<uint8_t*>(mapped.address()), mapped.size());
+        data.back() = 142;
+    }
+    EXPECT_EQ(fs::file_size(m_tmpFile), overmapSize);
+    {
+        std::ifstream ifile(m_tmpFile, std::ios::binary);
+        uint8_t       lastByte;
+        ifile.seekg(overmapSize - sizeof(lastByte));
+        ifile.read(reinterpret_cast<char*>(&lastByte), sizeof(lastByte));
+        EXPECT_EQ(lastByte, 142);
+    }
+}
+
+TEST(MappedFile, LinuxCreate) {
     fs::path tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
     EXPECT_FALSE(fs::exists(tmpFile2));
     {
@@ -186,7 +207,7 @@ TEST_F(MappedFileFixture, LinuxReserve) {
     EXPECT_EQ(*reinterpret_cast<const int*>(mapped.address()), 42);
 }
 
-TEST_F(MappedFileFixture, LinuxResize) {
+TEST(MappedFile, LinuxResize) {
     // Reserve some virtual address space
     detail::MemoryMap<PROT_NONE> reserved(nullptr, detail::pageSize() * 4,
                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -250,9 +271,86 @@ TEST_F(MappedFileFixture, LinuxResize) {
     EXPECT_FALSE(fs::exists(tmpFile2));
 }
 
-// TODO:
-// - MAP_HUGETLB
-// - MAP_HUGE_2MB, MAP_HUGE_1GB
+std::vector<unsigned char> getResidency(void* base, size_t size) {
+    std::vector<unsigned char> result(size / getpagesize(), 0u);
+    int                        ret = mincore(base, size, result.data());
+    if (ret != 0)
+        throw detail::LastError();
+    return result;
+}
+
+TEST_F(MappedFileFixture, LinuxResidencyAfterTruncate) {
+    // Map the 1-int sized file to a much larger range
+    EXPECT_EQ(fs::file_size(m_tmpFile), sizeof(int));
+    size_t                                    newSize = 16 * 1024 * 1024;
+    detail::FileDescriptor                    fd(m_tmpFile, O_RDWR);
+    detail::MemoryMap<PROT_READ | PROT_WRITE> mapped(nullptr, newSize, MAP_SHARED, fd, 0);
+
+    // Increase the file size to match the mapping and check no pages are
+    // resident yet. Actually the first page is, but at least the rest should be
+    // untouched.
+    fd.truncate(newSize);
+    EXPECT_TRUE(
+        std::ranges::all_of(getResidency(mapped.address(getpagesize()), newSize - getpagesize()),
+                            [](unsigned char c) { return (c & 1u) == 0; }));
+
+    // Fill the conents of the file and confirm pages are allocated
+    std::ranges::fill(std::span(reinterpret_cast<uint8_t*>(mapped.address()), newSize),
+                      uint8_t(0xff));
+    EXPECT_TRUE(std::ranges::all_of(getResidency(mapped.address(), newSize),
+                                    [](unsigned char c) { return (c & 1u) == 1; }));
+
+    // Empty the file and check those pages are no longer resident
+    fd.truncate(0);
+    EXPECT_TRUE(std::ranges::all_of(getResidency(mapped.address(), newSize),
+                                    [](unsigned char c) { return (c & 1u) == 0; }));
+    EXPECT_EQ(fs::file_size(m_tmpFile), 0);
+}
+
+TEST(MappedMemory, LinuxResidencyAfterDecommit) {
+    const size_t page_size = getpagesize();
+    const size_t reserve_size = page_size * 64; // 64 pages total
+    const size_t commit_size = page_size * 4;   // We'll use 4 pages
+
+    // Reserve virtual address space (uncommitted, inaccessible)
+    void* base =
+        mmap(nullptr, reserve_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    ASSERT_NE(base, MAP_FAILED) << "Failed to mmap reserved space";
+    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
+                                    [](unsigned char c) { return (c & 1u) == 0; }));
+
+    // Commit a portion with PROT_READ | PROT_WRITE
+    int prot_result = mprotect(base, commit_size, PROT_READ | PROT_WRITE);
+    ASSERT_EQ(prot_result, 0) << "Failed to mprotect committed region";
+    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
+                                    [](unsigned char c) { return (c & 1u) == 0; }));
+
+    // Touch the memory to ensure it's backed by RAM
+    std::span committed(static_cast<std::byte*>(base), commit_size);
+    std::ranges::fill(committed, std::byte(0xAB));
+
+    // Verify pages are resident using mincore
+    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
+                                    [](unsigned char c) { return (c & 1u) == 1; }));
+
+    // Decommit
+    #if 0
+    void* remap = mmap(base, commit_size, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    ASSERT_EQ(remap, base) << "Failed to remap to decommit pages";
+    #else
+    // See MADV_FREE discussion here: https://github.com/golang/go/issues/42330
+    prot_result = mprotect(base, commit_size, PROT_NONE);
+    ASSERT_EQ(prot_result, 0) << "Failed to mprotect committed region back to PROT_NONE";
+    int madvise_result = madvise(base, commit_size, MADV_DONTNEED);
+    ASSERT_EQ(madvise_result, 0) << "Failed to release pages with madvise";
+    #endif
+    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
+                                    [](uint8_t c) { return (c & 1u) == 0; }));
+
+    // Cleanup
+    munmap(base, reserve_size);
+}
 
 #endif
 
@@ -456,8 +554,34 @@ TEST_F(MappedFileFixture, ResizableFileSync) {
     }
 }
 
-TEST_F(MappedFileFixture, Readme) {
-    fs::path       tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
+TEST(MappedFile, Empty) {
+    fs::path tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
+    EXPECT_FALSE(fs::exists(tmpFile2));
+    {
+        size_t         maxSize = 4096;
+        resizable_file file(tmpFile2, maxSize);
+        EXPECT_TRUE(fs::exists(tmpFile2));
+        EXPECT_EQ(file.size(), 0);
+    }
+    EXPECT_TRUE(fs::exists(tmpFile2));
+    EXPECT_EQ(fs::file_size(tmpFile2), 0);
+    fs::remove(tmpFile2);
+    EXPECT_FALSE(fs::exists(tmpFile2));
+}
+
+TEST_F(MappedFileFixture, ClearExisting) {
+    EXPECT_EQ(fs::file_size(m_tmpFile), sizeof(int));
+    {
+        size_t         maxSize = 4096;
+        resizable_file file(m_tmpFile, maxSize);
+        EXPECT_EQ(file.size(), sizeof(int));
+        file.resize(0);
+    }
+    EXPECT_EQ(fs::file_size(m_tmpFile), 0);
+}
+
+TEST(MappedFile, Readme) {
+    fs::path tmpFile2 = fs::path{testing::TempDir()} / "test2.dat";
     {
         size_t         maxSize = 4096;
         resizable_file file(tmpFile2, maxSize);
@@ -477,58 +601,3 @@ TEST_F(MappedFileFixture, Readme) {
     fs::remove(tmpFile2);
     EXPECT_FALSE(fs::exists(tmpFile2));
 }
-
-#ifndef _WIN32
-std::vector<uint8_t> getResidency(void* base, size_t size) {
-    std::vector<unsigned char> result(size / getpagesize(), 0u);
-    int                        ret = mincore(base, size, result.data());
-    if (ret != 0)
-        throw detail::LastError();
-    return result;
-}
-
-TEST(MappedMemory, PageResidencyAfterDecommit) {
-    const size_t page_size = getpagesize();
-    const size_t reserve_size = page_size * 64; // 64 pages total
-    const size_t commit_size = page_size * 4;   // We'll use 4 pages
-
-    // Reserve virtual address space (uncommitted, inaccessible)
-    void* base =
-        mmap(nullptr, reserve_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    ASSERT_NE(base, MAP_FAILED) << "Failed to mmap reserved space";
-    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
-                                    [](uint8_t c) { return (c & 1u) == 0; }));
-
-    // Commit a portion with PROT_READ | PROT_WRITE
-    int prot_result = mprotect(base, commit_size, PROT_READ | PROT_WRITE);
-    ASSERT_EQ(prot_result, 0) << "Failed to mprotect committed region";
-    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
-                                    [](uint8_t c) { return (c & 1u) == 0; }));
-
-    // Touch the memory to ensure it's backed by RAM
-    std::span committed(static_cast<std::byte*>(base), commit_size);
-    std::ranges::fill(committed, std::byte(0xAB));
-
-    // Verify pages are resident using mincore
-    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
-                                    [](uint8_t c) { return (c & 1u) == 1; }));
-
-    // Decommit
-    #if 0
-    void* remap = mmap(base, commit_size, PROT_NONE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
-    ASSERT_EQ(remap, base) << "Failed to remap to decommit pages";
-    #else
-    // See MADV_FREE discussion here: https://github.com/golang/go/issues/42330
-    prot_result = mprotect(base, commit_size, PROT_NONE);
-    ASSERT_EQ(prot_result, 0) << "Failed to mprotect committed region back to PROT_NONE";
-    int madvise_result = madvise(base, commit_size, MADV_DONTNEED);
-    ASSERT_EQ(madvise_result, 0) << "Failed to release pages with madvise";
-    #endif
-    EXPECT_TRUE(std::ranges::all_of(getResidency(base, commit_size),
-                                    [](uint8_t c) { return (c & 1u) == 0; }));
-
-    // Cleanup
-    munmap(base, reserve_size);
-}
-#endif
