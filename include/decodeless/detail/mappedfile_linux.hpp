@@ -74,7 +74,7 @@ public:
     }
     size_t size() const { return static_cast<size_t>(stat().st_size); }
     void   truncate(size_t size) {
-        if (ftruncate(m_fd, size) == -1)
+        if (ftruncate(m_fd, static_cast<off_t>(size)) == -1)
             throw LastError();
     }
     explicit operator bool() const = delete;  // possibly unexpected due to operator int()
@@ -133,7 +133,7 @@ public:
         requires Writable
     {
         assert(offset + size <= m_size);
-        size_t alignedOffset = offset & ~(pageSize() - 1);
+        size_t alignedOffset = offset & ~static_cast<size_t>(pageSize() - 1);
         size_t alignedSize = size + offset - alignedOffset;
         void*  offsetAddress = static_cast<void*>(
             static_cast<std::byte*>(const_cast<void*>(m_address)) + alignedOffset);
@@ -294,8 +294,8 @@ public:
             throw std::bad_alloc();
 
         // Align to the next page boundary
-        size_t ps = pageSize();
-        size_t newMappedSize = ((size + ps - 1) / ps) * ps;
+        size_t ps = static_cast<size_t>(pageSize());
+        size_t newMappedSize = (size + ps - 1) & ~(ps - 1);
 
         if (newMappedSize > m_mappedSize) {
             // Add just the new range
